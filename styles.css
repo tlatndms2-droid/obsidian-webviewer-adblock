@@ -1,0 +1,3 @@
+.wvab-status { cursor: pointer; }
+.wvab-excluded { opacity: .45; }
+.wvab-warning { color: var(--text-warning); }

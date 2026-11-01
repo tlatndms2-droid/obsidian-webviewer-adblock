@@ -1,0 +1,7 @@
+import http from 'node:http';
+http.createServer((req,res)=>{
+ res.setHeader('Cache-Control','no-store');
+ if(req.url==='/common/ad.js'){res.setHeader('Content-Type','text/javascript');res.end('window.adScriptLoaded=true;document.getElementById("network").textContent="광고 스크립트 실행됨"');return;}
+ if(req.url==='/article.js'){res.setHeader('Content-Type','text/javascript');res.end('window.articleScriptLoaded=true;document.getElementById("article-script").textContent="본문 기능 정상"');return;}
+ res.setHeader('Content-Type','text/html;charset=utf-8');res.end(`<!doctype html><html lang="ko"><head><title>광고 차단 검증 페이지</title><style>body{font:18px sans-serif;background:#f5f6f8;color:#20242b;padding:36px;line-height:1.6}main{max-width:850px;margin:auto}article,.ad-banner-300{padding:22px;background:white;border-radius:12px;margin:16px 0}.ad-banner-300{background:#ffdfaa;border:2px dashed #bd7315}button{padding:12px;font:inherit}</style></head><body><main><h1>웹뷰어 광고 차단 검증</h1><article><h2>읽고 싶은 본문</h2><p>이 문장과 본문 기능은 광고 차단 여부와 관계없이 남아 있어야 합니다.</p><p id="article-script">본문 기능 대기</p><p id="network">광고 스크립트 차단됨</p><button onclick="const e=document.createElement('div');e.className='ad-banner-300';e.textContent='나중에 추가된 광고';document.querySelector('main').append(e)">동적 광고 추가</button></article><div class="ad-banner-300">광고 배너 영역 — 차단 해제 시 표시</div></main><script src="/common/ad.js"></script><script src="/article.js"></script></body></html>`);
+}).listen(19846,'127.0.0.1',()=>console.log('Fixture server http://127.0.0.1:19846'));

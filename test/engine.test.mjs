@@ -1,0 +1,15 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {FiltersEngine,Request} from '@ghostery/adblocker';
+import {readFile} from 'node:fs/promises';
+import {build} from 'esbuild';
+await build({entryPoints:['src/core.ts'],outfile:'artifacts/core.mjs',format:'esm',platform:'node'});
+const {hostname,excluded,requestType,validateList}=await import('../artifacts/core.mjs');
+const snapshot=JSON.parse(await readFile(new URL('../src/generated/engine.json',import.meta.url)));
+const engine=FiltersEngine.deserialize(Buffer.from(snapshot.data,'base64'));
+const match=(url,type='script')=>engine.match(Request.fromRawDetails({url,type,sourceUrl:'http://adblock.test.localhost:19846/'})).match;
+test('bundled production filters block ad script and preserve content',()=>{assert.equal(match('http://adblock.test.localhost:19846/common/ad.js'),true);assert.equal(match('http://adblock.test.localhost:19846/article.js'),false);assert.equal(match('https://td.doubleclick.net/pagead/ads'),true);});
+test('domain exceptions include subdomains but not lookalikes',()=>{assert.equal(excluded('https://sub.example.com',['example.com']),true);assert.equal(excluded('https://badexample.com',['example.com']),false);assert.equal(hostname('EXAMPLE.COM.'),'example.com');assert.equal(hostname('file:///secret'),'');});
+test('cosmetic filters hide actual generic ad selector',()=>{const r=engine.getCosmeticsFilters({url:'http://adblock.test.localhost:19846/',hostname:'adblock.test.localhost',domain:'adblock.test.localhost',classes:['ad-banner-300'],ids:[],getBaseRules:true,getInjectionRules:false,getExtendedRules:false});assert.match(r.styles,/ad-banner-300/);});
+test('network type mapping and failed download validation',()=>{assert.equal(requestType('XHR',false),'xmlhttprequest');assert.equal(requestType('Document',false),'sub_frame');assert.equal(validateList('<html>'+ 'x'.repeat(2000)),false);assert.equal(validateList('||ads.example^\n'.repeat(100)),true);});
+test('filter exception takes precedence over block',()=>{const e=FiltersEngine.parse('||ads.example^\n@@||ads.example/safe.js$script');assert.equal(e.match(Request.fromRawDetails({url:'https://ads.example/safe.js',sourceUrl:'https://example.com',type:'script'})).match,false);});

@@ -1,0 +1,9 @@
+{
+  "id": "webviewer-adblock",
+  "name": "Webviewer Adblock",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.3",
+  "description": "기본 웹뷰어의 광고와 추적 요청을 추가 차단하고 광고 영역을 숨깁니다.",
+  "author": "suzakka",
+  "isDesktopOnly": true
+}

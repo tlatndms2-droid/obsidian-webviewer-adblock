@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-webviewer-adblock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ghostery/adblocker": "^2.15.0",
+    "tldts-experimental": "^7.4.19"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.9.0"
+  }
+}
