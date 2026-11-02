@@ -2,3 +2,4 @@ node_modules/
 .tools/
 artifacts/
 *.zip
+main.js.tmp

@@ -3,14 +3,15 @@ import {FiltersEngine, Request} from '@ghostery/adblocker';
 import {parse} from 'tldts-experimental';
 import snapshot from './generated/engine.json';
 import {FILTER_URLS, excluded, hostname, requestType, validateList} from './core';
+import {isYouTubePlayerResponse,stripYouTubeAds,youtubeGuardSource,STOP_YOUTUBE_GUARD} from './youtube';
 
 interface Options {enabled:boolean; cosmetic:boolean; excluded:string[]; updated:string}
 const defaults:Options={enabled:true,cosmetic:true,excluded:[],updated:''};
 const BINDING='__webviewerAdblockTokens';
-const WATCHER=`(()=>{window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);let previous='';const scan=()=>{const classes=new Set(),ids=new Set();for(const el of Array.from(document.querySelectorAll('[class],[id]')).slice(0,10000)){if(el.id&&ids.size<2000)ids.add(el.id);for(const c of el.classList)if(classes.size<2000)classes.add(c)}const value=JSON.stringify({classes:[...classes],ids:[...ids]});if(value!==previous){previous=value;window.${BINDING}?.(value)}};window.__wvabObserver=new MutationObserver(()=>{if(!window.__wvabTimer)window.__wvabTimer=setTimeout(()=>{window.__wvabTimer=0;scan()},1000)});window.__wvabObserver.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class','id']});scan()})()`;
-const STOP_WATCHER=`window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer)`;
+const WATCHER=`(()=>{window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);window.__wvabTimer=0;let previous='';const scan=()=>{const classes=new Set(),ids=new Set();for(const el of Array.from(document.querySelectorAll('[class],[id]')).slice(0,10000)){if(el.id&&ids.size<2000)ids.add(el.id);for(const c of el.classList)if(classes.size<2000)classes.add(c)}const value=JSON.stringify({classes:[...classes],ids:[...ids]});if(value!==previous){previous=value;window.${BINDING}?.(value)}};window.__wvabObserver=new MutationObserver(()=>{if(!window.__wvabTimer)window.__wvabTimer=setTimeout(()=>{window.__wvabTimer=0;scan()},1000)});window.__wvabObserver.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class','id']});scan()})()`;
+const STOP_WATCHER=`window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);window.__wvabTimer=0`;
 
-type Context={wc:any; view:any; webview:any; active:boolean; blocked:number; cssKey?:string; cssText:string; cssRevision:number; message:(...args:any[])=>void; detach:(...args:any[])=>void; ready:()=>void; navigate:()=>void; action?:HTMLElement; attaching:boolean;mainFrame?:string;frames:Map<string,any>;retryAfter:number;disposed:boolean;connection?:Promise<void>};
+type Context={wc:any; view:any; webview:any; active:boolean; blocked:number; cssKey?:string; cssText:string; cssRevision:number; message:(...args:any[])=>void; detach:(...args:any[])=>void; ready:()=>void; navigate:()=>void; action?:HTMLElement; attaching:boolean;mainFrame?:string;frames:Map<string,any>;retryAfter:number;disposed:boolean;connection?:Promise<void>;youtubeScriptId?:string;youtubeConfig?:string;youtubeRevision:number;inPage:()=>void};
 
 export default class WebviewerAdblock extends Plugin {
   options:Options={...defaults};
@@ -66,10 +67,12 @@ export default class WebviewerAdblock extends Plugin {
       if(!this.watched.has(webview)){this.watched.add(webview);const scan=()=>this.scan();webview.addEventListener('did-attach',scan);webview.addEventListener('dom-ready',scan);this.register(()=>{webview.removeEventListener('did-attach',scan);webview.removeEventListener('dom-ready',scan);});}
       try{const id=webview.getWebContentsId();alive.add(id);if(!this.contexts.has(id)){
         const remote=require('@electron/remote');const wc=remote.webContents.fromId(id);if(!wc)continue;
-        const ctx:Context={wc,view,webview,active:false,attaching:false,blocked:0,cssText:'',cssRevision:0,message:()=>{},detach:()=>{},ready:()=>{},navigate:()=>{},frames:new Map(),retryAfter:0,disposed:false};
+        const ctx:Context={wc,view,webview,active:false,attaching:false,blocked:0,cssText:'',cssRevision:0,message:()=>{},detach:()=>{},ready:()=>{},navigate:()=>{},frames:new Map(),retryAfter:0,disposed:false,youtubeRevision:0,inPage:()=>{}};
         ctx.ready=()=>{void this.startCosmetics(ctx)};
         ctx.navigate=()=>{ctx.cssKey=undefined;ctx.cssText='';ctx.cssRevision++;ctx.blocked=0;this.updateAction(ctx);};
+        ctx.inPage=()=>{ctx.cssRevision++;this.updateAction(ctx);void this.startCosmetics(ctx);};
         webview.addEventListener('dom-ready',ctx.ready);webview.addEventListener('did-navigate',ctx.navigate);
+        webview.addEventListener('did-navigate-in-page',ctx.inPage);
         ctx.action=view.addAction('shield-check','이 사이트의 추가 광고 차단 전환',()=>{void this.toggleSite(view)});
         this.contexts.set(id,ctx);
       }const ctx=this.contexts.get(id)!;this.updateAction(ctx);if(this.options.enabled&&!ctx.active&&!ctx.attaching&&Date.now()>ctx.retryAfter)ctx.connection=this.attach(ctx);
@@ -95,7 +98,7 @@ export default class WebviewerAdblock extends Plugin {
     view.navigate=wrapped;
     this.navigationPatches.set(view,()=>{if(view.navigate===wrapped){if(hadOwn)view.navigate=original;else delete view.navigate;}});
   }
-  updateAction(ctx:Context){try{const on=this.enabledFor(ctx.wc.getURL());ctx.action?.toggleClass('wvab-excluded',!on);ctx.action?.setAttribute('aria-label',`${on?'추가 차단 켜짐':'추가 차단 해제됨'} · 클릭하여 전환`);}catch{}}
+  updateAction(ctx:Context){try{const on=this.enabledFor(ctx.wc.getURL());ctx.action?.toggleClass('wvab-excluded',!on);ctx.action?.setAttribute('aria-label',on?'광고 차단 중 · 클릭하면 이 사이트의 추가 차단 해제':'추가 차단 꺼짐 · 클릭하면 이 사이트 광고 차단 켜기');}catch{}}
   async attach(ctx:Context){
     ctx.attaching=true;
     try{
@@ -105,6 +108,7 @@ export default class WebviewerAdblock extends Plugin {
         if(method==='Fetch.requestPaused')void this.handleRequest(ctx,params);
         if(method==='Page.frameNavigated'){ctx.frames.set(params.frame.id,params.frame);if(!params.frame.parentId)ctx.mainFrame=params.frame.id;}
         if(method==='Page.frameDetached')ctx.frames.delete(params.frameId);
+        if(method==='Page.navigatedWithinDocument'){const frame=ctx.frames.get(params.frameId);if(frame)frame.url=params.url;}
         if(method==='Runtime.bindingCalled'&&params.name===BINDING&&this.options.cosmetic&&this.enabledFor(ctx.wc.getURL())){
           try{const tokens=JSON.parse(params.payload);if(Array.isArray(tokens.classes)&&Array.isArray(tokens.ids))void this.cosmetics(ctx,tokens.classes.slice(0,2000),tokens.ids.slice(0,2000));}catch{}
         }
@@ -116,13 +120,16 @@ export default class WebviewerAdblock extends Plugin {
       const collect=(node:any)=>{ctx.frames.set(node.frame.id,node.frame);for(const child of node.childFrames||[])collect(child);};collect(tree.frameTree);ctx.mainFrame=tree.frameTree.frame.id;
       await ctx.wc.debugger.sendCommand('Runtime.enable');
       await ctx.wc.debugger.sendCommand('Runtime.addBinding',{name:BINDING});
-      await ctx.wc.debugger.sendCommand('Fetch.enable',{patterns:[{urlPattern:'http*://*/*',requestStage:'Request'}]});
+      await this.configureYouTube(ctx);
+      const responsePatterns=['player','next'].flatMap(endpoint=>['youtube.com','*.youtube.com'].map(host=>({urlPattern:`https://${host}/youtubei/v1/${endpoint}*`,requestStage:'Response'})));
+      await ctx.wc.debugger.sendCommand('Fetch.enable',{patterns:[{urlPattern:'http*://*/*',requestStage:'Request'},...responsePatterns]});
       if(this.stopped||ctx.disposed||!this.options.enabled||this.contexts.get(ctx.wc.id)!==ctx){await this.dispose(ctx);return;}
       this.lastError='';this.refreshStatus();
       await this.startCosmetics(ctx);
     }catch(e){ctx.retryAfter=Date.now()+30000;this.report(e);if(ctx.active){await this.releaseDebugger(ctx);}}finally{ctx.attaching=false;}
   }
   async handleRequest(ctx:Context,p:any){
+    if(p.responseStatusCode!==undefined||p.responseErrorReason!==undefined){await this.handleYouTubeResponse(ctx,p);return;}
     const d=ctx.wc.debugger;let command='Fetch.continueRequest';let params:any={requestId:p.requestId};
     try{
       const source=ctx.frames.get(p.frameId)?.url||ctx.wc.getURL();
@@ -135,9 +142,37 @@ export default class WebviewerAdblock extends Plugin {
     }catch(e){this.report(e);}
     try{await d.sendCommand(command,params);}catch{/* Navigation or detach may cancel a paused request. */}
   }
+  async handleYouTubeResponse(ctx:Context,p:any){
+    const d=ctx.wc.debugger;
+    try{
+      if(this.enabledFor(ctx.wc.getURL())&&isYouTubePlayerResponse(p.request.url)&&p.responseStatusCode===200){
+        const body=await d.sendCommand('Fetch.getResponseBody',{requestId:p.requestId});
+        const raw=body.base64Encoded?Buffer.from(body.body,'base64').toString('utf8'):body.body;
+        if(raw.length<=8*1024*1024){
+          const prefix=raw.match(/^\)\]\}'\s*/)?.[0]||'';
+          const value=JSON.parse(raw.slice(prefix.length));const before=JSON.stringify(value);stripYouTubeAds(value);const after=JSON.stringify(value);
+          if(before!==after){
+            const responseHeaders=(p.responseHeaders||[]).filter((h:any)=>!['content-length','content-encoding','transfer-encoding'].includes(h.name.toLowerCase()));
+            await d.sendCommand('Fetch.fulfillRequest',{requestId:p.requestId,responseCode:p.responseStatusCode,responseHeaders,body:Buffer.from(prefix+after).toString('base64')});
+            this.total++;ctx.blocked++;this.refreshStatus();return;
+          }
+        }
+      }
+    }catch(e){if(ctx.active)this.report(e);}
+    try{await d.sendCommand('Fetch.continueRequest',{requestId:p.requestId});}catch{}
+  }
+  private async configureYouTube(ctx:Context){
+    const source=youtubeGuardSource(this.options.cosmetic,this.options.excluded);
+    if(ctx.youtubeConfig===source&&ctx.youtubeScriptId)return;
+    const revision=++ctx.youtubeRevision;
+    if(ctx.youtubeScriptId){const old=ctx.youtubeScriptId;ctx.youtubeScriptId=undefined;await ctx.wc.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument',{identifier:old});}
+    const result=await ctx.wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument',{source});
+    if(ctx.disposed||!ctx.active||revision!==ctx.youtubeRevision){await ctx.wc.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument',{identifier:result.identifier});return;}
+    ctx.youtubeScriptId=result.identifier;ctx.youtubeConfig=source;
+  }
   async startCosmetics(ctx:Context){
     if(!ctx.active)return;
-    try{if(this.options.cosmetic&&this.enabledFor(ctx.wc.getURL())){await ctx.wc.executeJavaScript(WATCHER);}else{await ctx.wc.executeJavaScript(STOP_WATCHER);await this.clearCSS(ctx);}}catch{/* A navigation may destroy this document. */}
+    try{await this.configureYouTube(ctx);await ctx.wc.executeJavaScript(youtubeGuardSource(this.options.cosmetic,this.options.excluded));if(this.options.cosmetic&&this.enabledFor(ctx.wc.getURL())){await ctx.wc.executeJavaScript(WATCHER);}else{await ctx.wc.executeJavaScript(STOP_WATCHER);await this.clearCSS(ctx);}}catch{/* A navigation may destroy this document. */}
   }
   async cosmetics(ctx:Context,classes:string[],ids:string[]){
     try{
@@ -156,11 +191,12 @@ export default class WebviewerAdblock extends Plugin {
     ctx.disposed=true;
     ctx.action?.remove();ctx.action=undefined;
     ctx.webview.removeEventListener('dom-ready',ctx.ready);ctx.webview.removeEventListener('did-navigate',ctx.navigate);
+    ctx.webview.removeEventListener('did-navigate-in-page',ctx.inPage);
     await this.releaseDebugger(ctx);
-    try{await ctx.wc.executeJavaScript(STOP_WATCHER)}catch{}
+    try{await ctx.wc.executeJavaScript(STOP_WATCHER+';'+STOP_YOUTUBE_GUARD)}catch{}
     await this.clearCSS(ctx);
   }
-  async releaseDebugger(ctx:Context){if(ctx.active){ctx.active=false;try{await ctx.wc.debugger.sendCommand('Fetch.disable');await ctx.wc.debugger.sendCommand('Runtime.removeBinding',{name:BINDING});ctx.wc.debugger.detach();}catch{}try{ctx.wc.debugger.removeListener('message',ctx.message);ctx.wc.debugger.removeListener('detach',ctx.detach);}catch{}}}
+  async releaseDebugger(ctx:Context){if(ctx.active){ctx.active=false;ctx.youtubeRevision++;try{await ctx.wc.debugger.sendCommand('Fetch.disable');if(ctx.youtubeScriptId)await ctx.wc.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument',{identifier:ctx.youtubeScriptId});ctx.youtubeScriptId=undefined;ctx.youtubeConfig=undefined;await ctx.wc.debugger.sendCommand('Runtime.removeBinding',{name:BINDING});ctx.wc.debugger.detach();}catch{}try{ctx.wc.debugger.removeListener('message',ctx.message);ctx.wc.debugger.removeListener('detach',ctx.detach);}catch{}}}
   async apply(){
     await this.saveData(this.options);
     if(!this.options.enabled){const contexts=[...this.contexts.values()];this.contexts.clear();await Promise.all(contexts.map(c=>this.dispose(c)));}
@@ -190,13 +226,13 @@ class AdblockSettings extends PluginSettingTab {
   constructor(app:any,private plugin:WebviewerAdblock){super(app,plugin)}
   display(){
     const {containerEl}=this;const p=this.plugin;containerEl.empty();containerEl.createEl('h2',{text:'웹뷰어 광고 차단'});
-    containerEl.createEl('p',{text:'Obsidian 기본 웹뷰어의 광고·추적 요청을 추가 차단합니다. 기본 광고 차단 설정은 그대로 유지됩니다.'});
+    containerEl.createEl('p',{text:'Obsidian 기본 웹뷰어의 광고·추적 요청을 추가 차단합니다. YouTube는 다른 영상으로 이동해도 자동 처리합니다. 기본 광고 차단 설정은 그대로 유지됩니다.'});
     new Setting(containerEl).setName('추가 광고 차단').setDesc('기본 웹뷰어 탭에 적용합니다. 변경 후 열린 페이지를 새로고침하세요.').addToggle(t=>t.setValue(p.options.enabled).onChange(async v=>{p.options.enabled=v;await p.apply();}));
     new Setting(containerEl).setName('광고 영역 숨기기').setDesc('필터에 일치하는 배너와 광고 상자를 숨깁니다.').addToggle(t=>t.setValue(p.options.cosmetic).onChange(async v=>{p.options.cosmetic=v;await p.apply();}));
     new Setting(containerEl).setName('추가 차단 제외 사이트').setDesc('한 줄에 도메인 하나. 하위 도메인에도 적용됩니다. 기본 광고 차단은 유지됩니다.').addTextArea(t=>{t.setPlaceholder('example.com').setValue(p.options.excluded.join('\n'));t.inputEl.rows=5;t.onChange(async v=>{p.options.excluded=[...new Set(v.split(/\s+/).map(hostname).filter(Boolean))];await p.apply();});});
     new Setting(containerEl).setName('광고 필터 업데이트').setDesc(`EasyList · EasyPrivacy · List-KR / 적용일: ${new Date(p.options.updated||snapshot.date).toLocaleDateString()}`).addButton(b=>b.setButtonText('지금 업데이트').onClick(async()=>{b.setDisabled(true);b.setButtonText('업데이트 중…');await p.updateFilters();this.display();}));
-    containerEl.createEl('p',{text:`이번 실행에서 추가 차단한 요청: ${p.total}개. 웹뷰어 오른쪽 위 방패 버튼으로 현재 사이트를 제외할 수 있습니다.`});
-    containerEl.createEl('p',{text:'YouTube 동영상 광고, 사이트의 광고 차단 감지, 고급 스크립트 필터는 완전 차단을 보장하지 않습니다. 개발자 도구를 사용하는 탭은 추가 차단 연결이 제한될 수 있습니다.',cls:'setting-item-description'});
+    containerEl.createEl('p',{text:`이번 실행의 추가 차단·광고 응답 정리: ${p.total}개. 광고 차단은 자동입니다. 방패 버튼은 사이트별 차단 해제/활성화용이며 영상마다 누를 필요가 없습니다.`});
+    containerEl.createEl('p',{text:'업데이트 후 이미 열려 있던 YouTube 탭은 한 번 새로고침하세요. 제외 목록에 YouTube가 있으면 삭제해야 자동 차단이 적용됩니다. 사이트의 광고 전달 방식 변경이나 개발자 도구 사용으로 차단이 제한될 수 있습니다.',cls:'setting-item-description'});
     if(p.lastError)containerEl.createEl('p',{text:`연결 안내: ${p.lastError}`,cls:'wvab-warning'});
   }
 }

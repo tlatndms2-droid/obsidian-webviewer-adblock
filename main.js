@@ -3161,7 +3161,7 @@ var Config = class _Config {
 
 // node_modules/@ghostery/adblocker/dist/esm/queue-microtask.js
 var promise;
-var queueMicrotask = typeof window !== "undefined" && typeof window.queueMicrotask === "function" ? (cb) => window.queueMicrotask(cb) : (
+var queueMicrotask2 = typeof window !== "undefined" && typeof window.queueMicrotask === "function" ? (cb) => window.queueMicrotask(cb) : (
   // reuse resolved promise, and allocate it lazily
   (cb) => (promise || (promise = Promise.resolve())).then(cb).catch((err) => setTimeout(() => {
     throw err;
@@ -3192,7 +3192,7 @@ function triggerCallback(event, args, listeners) {
   }
   const listenersForEvent = listeners.get(event);
   if (listenersForEvent !== void 0) {
-    queueMicrotask(() => {
+    queueMicrotask2(() => {
       for (const listener of listenersForEvent) {
         listener(...args);
       }
@@ -11543,11 +11543,192 @@ function validateList(text) {
   return text.length > 1e3 && !/^\s*</.test(text) && (text.includes("||") || text.includes("##"));
 }
 
+// src/youtube.ts
+function stripYouTubeAds(value) {
+  const visit = (player) => {
+    if (!player || typeof player !== "object" || Array.isArray(player)) return;
+    for (const key of ["playerAds", "adPlacements", "adSlots", "adBreakHeartbeatParams"]) {
+      if (Object.hasOwn(player, key)) delete player[key];
+    }
+  };
+  visit(value);
+  if (value && typeof value === "object") {
+    visit(value.playerResponse);
+    for (const response of Array.isArray(value.playerResponses) ? value.playerResponses : []) visit(response);
+  }
+  return value;
+}
+function isYouTube(url) {
+  try {
+    const u = new URL(url);
+    return /^https?:$/.test(u.protocol) && (u.hostname === "youtube.com" || u.hostname.endsWith(".youtube.com"));
+  } catch {
+    return false;
+  }
+}
+function isYouTubePlayerResponse(url) {
+  if (!isYouTube(url)) return false;
+  const path = new URL(url).pathname;
+  return /^\/youtubei\/v1\/(player|next)$/.test(path);
+}
+function installYouTubeGuard(prune, hideBanners, excluded2) {
+  if (location.hostname !== "youtube.com" && !location.hostname.endsWith(".youtube.com")) return;
+  const root = window;
+  if (excluded2.some((host) => location.hostname === host || location.hostname.endsWith("." + host))) {
+    root.__wvabYouTube?.stop();
+    return;
+  }
+  const existing = root.__wvabYouTube;
+  if (existing) {
+    existing.setBanners(hideBanners);
+    existing.refresh();
+    return;
+  }
+  let stopped = false;
+  const originalParse = JSON.parse;
+  const wrappedParse = function(...args) {
+    return prune(originalParse.apply(this, args));
+  };
+  JSON.parse = wrappedParse;
+  let initial = root.ytInitialPlayerResponse;
+  const initialDescriptor = Object.getOwnPropertyDescriptor(root, "ytInitialPlayerResponse");
+  const getInitial = () => initial;
+  const setInitial = (value) => {
+    initial = prune(value);
+  };
+  let hookedInitial = false;
+  if (!initialDescriptor || initialDescriptor.configurable) {
+    Object.defineProperty(root, "ytInitialPlayerResponse", { configurable: true, enumerable: true, get: getInitial, set: setInitial });
+    hookedInitial = true;
+  }
+  prune(initial);
+  const originalJson = Response.prototype.json;
+  const wrappedJson = function() {
+    return originalJson.call(this).then((value) => {
+      try {
+        const u = new URL(this.url);
+        if ((u.hostname === "youtube.com" || u.hostname.endsWith(".youtube.com")) && /^\/youtubei\/v1\/(player|next)$/.test(u.pathname)) return prune(value);
+      } catch {
+      }
+      return value;
+    });
+  };
+  Response.prototype.json = wrappedJson;
+  let style;
+  const setBanners = (enabled) => {
+    if (!enabled) {
+      style?.remove();
+      style = void 0;
+      return;
+    }
+    if (style?.isConnected) return;
+    if (!document.documentElement) return;
+    style = document.createElement("style");
+    style.dataset.webviewerAdblock = "youtube";
+    style.textContent = "ytd-ad-slot-renderer,ytd-display-ad-renderer,ytd-in-feed-ad-layout-renderer,ytd-promoted-sparkles-web-renderer,ytd-promoted-video-renderer,ytd-action-companion-ad-renderer,ytd-player-legacy-desktop-watch-ads-renderer,#player-ads,#masthead-ad,.ytp-ad-overlay-container{display:none!important}";
+    document.documentElement.append(style);
+  };
+  let adVideo;
+  let adMarker = "";
+  const checkAd = () => {
+    if (stopped) return;
+    const player = document.querySelector("#movie_player");
+    const ad = !!player?.matches(".ad-showing,.ad-interrupting");
+    const video = player?.querySelector("video");
+    if (!ad) {
+      adVideo = void 0;
+      adMarker = "";
+      return;
+    }
+    const skip = player?.querySelector(".ytp-skip-ad-button,.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-ad-skip-button-container button");
+    if (skip && skip.getClientRects().length) {
+      skip.click();
+      return;
+    }
+    if (!video) return;
+    const contentDuration = Number(player?.getPlayerResponse?.()?.videoDetails?.lengthSeconds || root.ytInitialPlayerResponse?.videoDetails?.lengthSeconds);
+    if (contentDuration > 0 && Math.abs(video.duration - contentDuration) < 2) return;
+    if (adVideo !== video) {
+      adVideo = video;
+      adMarker = "";
+    }
+    if (Number.isFinite(video.duration) && video.duration > 0 && video.currentTime < video.duration - 0.05) {
+      const marker = `${video.currentSrc}|${video.duration}`;
+      if (adMarker !== marker) {
+        adMarker = marker;
+        try {
+          video.currentTime = video.duration;
+        } catch {
+        }
+      }
+    }
+  };
+  let scheduled = false;
+  const refresh = () => {
+    if (stopped) return;
+    prune(root.ytInitialPlayerResponse);
+    setBanners(hideBanners);
+    checkAd();
+  };
+  const schedule = () => {
+    if (stopped || scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      refresh();
+    });
+  };
+  const observer = new MutationObserver(schedule);
+  if (document.documentElement) observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
+  const ready = () => {
+    if (stopped) return;
+    if (document.documentElement) observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
+    refresh();
+  };
+  document.addEventListener("DOMContentLoaded", ready);
+  document.addEventListener("yt-navigate-finish", schedule);
+  document.addEventListener("yt-page-data-updated", schedule);
+  document.addEventListener("loadedmetadata", schedule, true);
+  document.addEventListener("durationchange", schedule, true);
+  document.addEventListener("play", schedule, true);
+  const interval = setInterval(checkAd, 500);
+  root.__wvabYouTube = {
+    refresh,
+    setBanners: (enabled) => {
+      hideBanners = enabled;
+      setBanners(enabled);
+    },
+    stop: () => {
+      stopped = true;
+      observer.disconnect();
+      clearInterval(interval);
+      style?.remove();
+      document.removeEventListener("DOMContentLoaded", ready);
+      document.removeEventListener("yt-navigate-finish", schedule);
+      document.removeEventListener("yt-page-data-updated", schedule);
+      document.removeEventListener("loadedmetadata", schedule, true);
+      document.removeEventListener("durationchange", schedule, true);
+      document.removeEventListener("play", schedule, true);
+      if (JSON.parse === wrappedParse) JSON.parse = originalParse;
+      if (Response.prototype.json === wrappedJson) Response.prototype.json = originalJson;
+      if (hookedInitial && Object.getOwnPropertyDescriptor(root, "ytInitialPlayerResponse")?.get === getInitial) {
+        Object.defineProperty(root, "ytInitialPlayerResponse", { configurable: true, enumerable: true, writable: true, value: initial });
+      }
+      delete root.__wvabYouTube;
+    }
+  };
+  refresh();
+}
+function youtubeGuardSource(hideBanners, excluded2 = []) {
+  return `(${installYouTubeGuard.toString()})(${stripYouTubeAds.toString()},${JSON.stringify(hideBanners)},${JSON.stringify(excluded2)});`;
+}
+var STOP_YOUTUBE_GUARD = "window.__wvabYouTube?.stop()";
+
 // src/main.ts
 var defaults = { enabled: true, cosmetic: true, excluded: [], updated: "" };
 var BINDING = "__webviewerAdblockTokens";
-var WATCHER = `(()=>{window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);let previous='';const scan=()=>{const classes=new Set(),ids=new Set();for(const el of Array.from(document.querySelectorAll('[class],[id]')).slice(0,10000)){if(el.id&&ids.size<2000)ids.add(el.id);for(const c of el.classList)if(classes.size<2000)classes.add(c)}const value=JSON.stringify({classes:[...classes],ids:[...ids]});if(value!==previous){previous=value;window.${BINDING}?.(value)}};window.__wvabObserver=new MutationObserver(()=>{if(!window.__wvabTimer)window.__wvabTimer=setTimeout(()=>{window.__wvabTimer=0;scan()},1000)});window.__wvabObserver.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class','id']});scan()})()`;
-var STOP_WATCHER = `window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer)`;
+var WATCHER = `(()=>{window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);window.__wvabTimer=0;let previous='';const scan=()=>{const classes=new Set(),ids=new Set();for(const el of Array.from(document.querySelectorAll('[class],[id]')).slice(0,10000)){if(el.id&&ids.size<2000)ids.add(el.id);for(const c of el.classList)if(classes.size<2000)classes.add(c)}const value=JSON.stringify({classes:[...classes],ids:[...ids]});if(value!==previous){previous=value;window.${BINDING}?.(value)}};window.__wvabObserver=new MutationObserver(()=>{if(!window.__wvabTimer)window.__wvabTimer=setTimeout(()=>{window.__wvabTimer=0;scan()},1000)});window.__wvabObserver.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class','id']});scan()})()`;
+var STOP_WATCHER = `window.__wvabObserver?.disconnect();clearTimeout(window.__wvabTimer);window.__wvabTimer=0`;
 var WebviewerAdblock = class extends import_obsidian.Plugin {
   options = { ...defaults };
   engine;
@@ -11649,7 +11830,8 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
           }, detach: () => {
           }, ready: () => {
           }, navigate: () => {
-          }, frames: /* @__PURE__ */ new Map(), retryAfter: 0, disposed: false };
+          }, frames: /* @__PURE__ */ new Map(), retryAfter: 0, disposed: false, youtubeRevision: 0, inPage: () => {
+          } };
           ctx2.ready = () => {
             void this.startCosmetics(ctx2);
           };
@@ -11660,8 +11842,14 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
             ctx2.blocked = 0;
             this.updateAction(ctx2);
           };
+          ctx2.inPage = () => {
+            ctx2.cssRevision++;
+            this.updateAction(ctx2);
+            void this.startCosmetics(ctx2);
+          };
           webview.addEventListener("dom-ready", ctx2.ready);
           webview.addEventListener("did-navigate", ctx2.navigate);
+          webview.addEventListener("did-navigate-in-page", ctx2.inPage);
           ctx2.action = view.addAction("shield-check", "\uC774 \uC0AC\uC774\uD2B8\uC758 \uCD94\uAC00 \uAD11\uACE0 \uCC28\uB2E8 \uC804\uD658", () => {
             void this.toggleSite(view);
           });
@@ -11728,7 +11916,7 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
     try {
       const on = this.enabledFor(ctx.wc.getURL());
       ctx.action?.toggleClass("wvab-excluded", !on);
-      ctx.action?.setAttribute("aria-label", `${on ? "\uCD94\uAC00 \uCC28\uB2E8 \uCF1C\uC9D0" : "\uCD94\uAC00 \uCC28\uB2E8 \uD574\uC81C\uB428"} \xB7 \uD074\uB9AD\uD558\uC5EC \uC804\uD658`);
+      ctx.action?.setAttribute("aria-label", on ? "\uAD11\uACE0 \uCC28\uB2E8 \uC911 \xB7 \uD074\uB9AD\uD558\uBA74 \uC774 \uC0AC\uC774\uD2B8\uC758 \uCD94\uAC00 \uCC28\uB2E8 \uD574\uC81C" : "\uCD94\uAC00 \uCC28\uB2E8 \uAEBC\uC9D0 \xB7 \uD074\uB9AD\uD558\uBA74 \uC774 \uC0AC\uC774\uD2B8 \uAD11\uACE0 \uCC28\uB2E8 \uCF1C\uAE30");
     } catch {
     }
   }
@@ -11747,6 +11935,10 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
           if (!params.frame.parentId) ctx.mainFrame = params.frame.id;
         }
         if (method === "Page.frameDetached") ctx.frames.delete(params.frameId);
+        if (method === "Page.navigatedWithinDocument") {
+          const frame = ctx.frames.get(params.frameId);
+          if (frame) frame.url = params.url;
+        }
         if (method === "Runtime.bindingCalled" && params.name === BINDING && this.options.cosmetic && this.enabledFor(ctx.wc.getURL())) {
           try {
             const tokens = JSON.parse(params.payload);
@@ -11772,7 +11964,9 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
       ctx.mainFrame = tree.frameTree.frame.id;
       await ctx.wc.debugger.sendCommand("Runtime.enable");
       await ctx.wc.debugger.sendCommand("Runtime.addBinding", { name: BINDING });
-      await ctx.wc.debugger.sendCommand("Fetch.enable", { patterns: [{ urlPattern: "http*://*/*", requestStage: "Request" }] });
+      await this.configureYouTube(ctx);
+      const responsePatterns = ["player", "next"].flatMap((endpoint) => ["youtube.com", "*.youtube.com"].map((host) => ({ urlPattern: `https://${host}/youtubei/v1/${endpoint}*`, requestStage: "Response" })));
+      await ctx.wc.debugger.sendCommand("Fetch.enable", { patterns: [{ urlPattern: "http*://*/*", requestStage: "Request" }, ...responsePatterns] });
       if (this.stopped || ctx.disposed || !this.options.enabled || this.contexts.get(ctx.wc.id) !== ctx) {
         await this.dispose(ctx);
         return;
@@ -11791,6 +11985,10 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
     }
   }
   async handleRequest(ctx, p) {
+    if (p.responseStatusCode !== void 0 || p.responseErrorReason !== void 0) {
+      await this.handleYouTubeResponse(ctx, p);
+      return;
+    }
     const d = ctx.wc.debugger;
     let command = "Fetch.continueRequest";
     let params = { requestId: p.requestId };
@@ -11815,9 +12013,58 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
     } catch {
     }
   }
+  async handleYouTubeResponse(ctx, p) {
+    const d = ctx.wc.debugger;
+    try {
+      if (this.enabledFor(ctx.wc.getURL()) && isYouTubePlayerResponse(p.request.url) && p.responseStatusCode === 200) {
+        const body = await d.sendCommand("Fetch.getResponseBody", { requestId: p.requestId });
+        const raw = body.base64Encoded ? Buffer.from(body.body, "base64").toString("utf8") : body.body;
+        if (raw.length <= 8 * 1024 * 1024) {
+          const prefix = raw.match(/^\)\]\}'\s*/)?.[0] || "";
+          const value = JSON.parse(raw.slice(prefix.length));
+          const before = JSON.stringify(value);
+          stripYouTubeAds(value);
+          const after = JSON.stringify(value);
+          if (before !== after) {
+            const responseHeaders = (p.responseHeaders || []).filter((h) => !["content-length", "content-encoding", "transfer-encoding"].includes(h.name.toLowerCase()));
+            await d.sendCommand("Fetch.fulfillRequest", { requestId: p.requestId, responseCode: p.responseStatusCode, responseHeaders, body: Buffer.from(prefix + after).toString("base64") });
+            this.total++;
+            ctx.blocked++;
+            this.refreshStatus();
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      if (ctx.active) this.report(e);
+    }
+    try {
+      await d.sendCommand("Fetch.continueRequest", { requestId: p.requestId });
+    } catch {
+    }
+  }
+  async configureYouTube(ctx) {
+    const source = youtubeGuardSource(this.options.cosmetic, this.options.excluded);
+    if (ctx.youtubeConfig === source && ctx.youtubeScriptId) return;
+    const revision = ++ctx.youtubeRevision;
+    if (ctx.youtubeScriptId) {
+      const old = ctx.youtubeScriptId;
+      ctx.youtubeScriptId = void 0;
+      await ctx.wc.debugger.sendCommand("Page.removeScriptToEvaluateOnNewDocument", { identifier: old });
+    }
+    const result = await ctx.wc.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source });
+    if (ctx.disposed || !ctx.active || revision !== ctx.youtubeRevision) {
+      await ctx.wc.debugger.sendCommand("Page.removeScriptToEvaluateOnNewDocument", { identifier: result.identifier });
+      return;
+    }
+    ctx.youtubeScriptId = result.identifier;
+    ctx.youtubeConfig = source;
+  }
   async startCosmetics(ctx) {
     if (!ctx.active) return;
     try {
+      await this.configureYouTube(ctx);
+      await ctx.wc.executeJavaScript(youtubeGuardSource(this.options.cosmetic, this.options.excluded));
       if (this.options.cosmetic && this.enabledFor(ctx.wc.getURL())) {
         await ctx.wc.executeJavaScript(WATCHER);
       } else {
@@ -11865,9 +12112,10 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
     ctx.action = void 0;
     ctx.webview.removeEventListener("dom-ready", ctx.ready);
     ctx.webview.removeEventListener("did-navigate", ctx.navigate);
+    ctx.webview.removeEventListener("did-navigate-in-page", ctx.inPage);
     await this.releaseDebugger(ctx);
     try {
-      await ctx.wc.executeJavaScript(STOP_WATCHER);
+      await ctx.wc.executeJavaScript(STOP_WATCHER + ";" + STOP_YOUTUBE_GUARD);
     } catch {
     }
     await this.clearCSS(ctx);
@@ -11875,8 +12123,12 @@ var WebviewerAdblock = class extends import_obsidian.Plugin {
   async releaseDebugger(ctx) {
     if (ctx.active) {
       ctx.active = false;
+      ctx.youtubeRevision++;
       try {
         await ctx.wc.debugger.sendCommand("Fetch.disable");
+        if (ctx.youtubeScriptId) await ctx.wc.debugger.sendCommand("Page.removeScriptToEvaluateOnNewDocument", { identifier: ctx.youtubeScriptId });
+        ctx.youtubeScriptId = void 0;
+        ctx.youtubeConfig = void 0;
         await ctx.wc.debugger.sendCommand("Runtime.removeBinding", { name: BINDING });
         ctx.wc.debugger.detach();
       } catch {
@@ -11959,7 +12211,7 @@ var AdblockSettings = class extends import_obsidian.PluginSettingTab {
     const p = this.plugin;
     containerEl.empty();
     containerEl.createEl("h2", { text: "\uC6F9\uBDF0\uC5B4 \uAD11\uACE0 \uCC28\uB2E8" });
-    containerEl.createEl("p", { text: "Obsidian \uAE30\uBCF8 \uC6F9\uBDF0\uC5B4\uC758 \uAD11\uACE0\xB7\uCD94\uC801 \uC694\uCCAD\uC744 \uCD94\uAC00 \uCC28\uB2E8\uD569\uB2C8\uB2E4. \uAE30\uBCF8 \uAD11\uACE0 \uCC28\uB2E8 \uC124\uC815\uC740 \uADF8\uB300\uB85C \uC720\uC9C0\uB429\uB2C8\uB2E4." });
+    containerEl.createEl("p", { text: "Obsidian \uAE30\uBCF8 \uC6F9\uBDF0\uC5B4\uC758 \uAD11\uACE0\xB7\uCD94\uC801 \uC694\uCCAD\uC744 \uCD94\uAC00 \uCC28\uB2E8\uD569\uB2C8\uB2E4. YouTube\uB294 \uB2E4\uB978 \uC601\uC0C1\uC73C\uB85C \uC774\uB3D9\uD574\uB3C4 \uC790\uB3D9 \uCC98\uB9AC\uD569\uB2C8\uB2E4. \uAE30\uBCF8 \uAD11\uACE0 \uCC28\uB2E8 \uC124\uC815\uC740 \uADF8\uB300\uB85C \uC720\uC9C0\uB429\uB2C8\uB2E4." });
     new import_obsidian.Setting(containerEl).setName("\uCD94\uAC00 \uAD11\uACE0 \uCC28\uB2E8").setDesc("\uAE30\uBCF8 \uC6F9\uBDF0\uC5B4 \uD0ED\uC5D0 \uC801\uC6A9\uD569\uB2C8\uB2E4. \uBCC0\uACBD \uD6C4 \uC5F4\uB9B0 \uD398\uC774\uC9C0\uB97C \uC0C8\uB85C\uACE0\uCE68\uD558\uC138\uC694.").addToggle((t) => t.setValue(p.options.enabled).onChange(async (v) => {
       p.options.enabled = v;
       await p.apply();
@@ -11982,8 +12234,8 @@ var AdblockSettings = class extends import_obsidian.PluginSettingTab {
       await p.updateFilters();
       this.display();
     }));
-    containerEl.createEl("p", { text: `\uC774\uBC88 \uC2E4\uD589\uC5D0\uC11C \uCD94\uAC00 \uCC28\uB2E8\uD55C \uC694\uCCAD: ${p.total}\uAC1C. \uC6F9\uBDF0\uC5B4 \uC624\uB978\uCABD \uC704 \uBC29\uD328 \uBC84\uD2BC\uC73C\uB85C \uD604\uC7AC \uC0AC\uC774\uD2B8\uB97C \uC81C\uC678\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.` });
-    containerEl.createEl("p", { text: "YouTube \uB3D9\uC601\uC0C1 \uAD11\uACE0, \uC0AC\uC774\uD2B8\uC758 \uAD11\uACE0 \uCC28\uB2E8 \uAC10\uC9C0, \uACE0\uAE09 \uC2A4\uD06C\uB9BD\uD2B8 \uD544\uD130\uB294 \uC644\uC804 \uCC28\uB2E8\uC744 \uBCF4\uC7A5\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uAC1C\uBC1C\uC790 \uB3C4\uAD6C\uB97C \uC0AC\uC6A9\uD558\uB294 \uD0ED\uC740 \uCD94\uAC00 \uCC28\uB2E8 \uC5F0\uACB0\uC774 \uC81C\uD55C\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4.", cls: "setting-item-description" });
+    containerEl.createEl("p", { text: `\uC774\uBC88 \uC2E4\uD589\uC758 \uCD94\uAC00 \uCC28\uB2E8\xB7\uAD11\uACE0 \uC751\uB2F5 \uC815\uB9AC: ${p.total}\uAC1C. \uAD11\uACE0 \uCC28\uB2E8\uC740 \uC790\uB3D9\uC785\uB2C8\uB2E4. \uBC29\uD328 \uBC84\uD2BC\uC740 \uC0AC\uC774\uD2B8\uBCC4 \uCC28\uB2E8 \uD574\uC81C/\uD65C\uC131\uD654\uC6A9\uC774\uBA70 \uC601\uC0C1\uB9C8\uB2E4 \uB204\uB97C \uD544\uC694\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.` });
+    containerEl.createEl("p", { text: "\uC5C5\uB370\uC774\uD2B8 \uD6C4 \uC774\uBBF8 \uC5F4\uB824 \uC788\uB358 YouTube \uD0ED\uC740 \uD55C \uBC88 \uC0C8\uB85C\uACE0\uCE68\uD558\uC138\uC694. \uC81C\uC678 \uBAA9\uB85D\uC5D0 YouTube\uAC00 \uC788\uC73C\uBA74 \uC0AD\uC81C\uD574\uC57C \uC790\uB3D9 \uCC28\uB2E8\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4. \uC0AC\uC774\uD2B8\uC758 \uAD11\uACE0 \uC804\uB2EC \uBC29\uC2DD \uBCC0\uACBD\uC774\uB098 \uAC1C\uBC1C\uC790 \uB3C4\uAD6C \uC0AC\uC6A9\uC73C\uB85C \uCC28\uB2E8\uC774 \uC81C\uD55C\uB420 \uC218 \uC788\uC2B5\uB2C8\uB2E4.", cls: "setting-item-description" });
     if (p.lastError) containerEl.createEl("p", { text: `\uC5F0\uACB0 \uC548\uB0B4: ${p.lastError}`, cls: "wvab-warning" });
   }
 };
